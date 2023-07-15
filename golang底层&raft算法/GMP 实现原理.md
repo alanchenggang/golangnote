@@ -196,27 +196,508 @@ type schedt struct {
 
 ```
 
-
-
 #### Q6.协程状态转换/调度类型
 
+通常，调度指的是由 g0 按照特定策略找到下一个可执行 g 的过程.而这里的“调度”，指的是调度器 p 实现从执行一个 g 切换到另一个 g 的过程.
 
+![9724e03e584ebe8944374d67a320d31b](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/9724e03e584ebe8944374d67a320d31b.png)
+
+宏观调度流程
+
+![83a6eb45a0f494f35a79dac98ecc6c41](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/83a6eb45a0f494f35a79dac98ecc6c41.png)
 
 #### Q7.获取可执行的 g 的方法
 
+![8ddb40b970d86c00586f7eb134f29d27](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/8ddb40b970d86c00586f7eb134f29d27.png)
 
+>（1）p 每执行 61 次调度，会从全局队列中获取一个 goroutine 进行执行，并将一个全局队列中的 goroutine 填充到当前 p 的本地队列中.(防止协程饿死)
+>
+>```go
+> if _p_.schedtick%61 == 0 && sched.runqsize > 0 {
+>        lock(&sched.lock)
+>        gp = globrunqget(_p_, 1)
+>        unlock(&sched.lock)
+>        if gp != nil {
+>            return gp, false, false
+>        }
+> }
+>```
+>
+>除了获取一个 g 用于执行外，还会额外将一个 g 从全局队列转移到 p 的本地队列，让全局队列中的 g 也得到更充分的执行机会.
+>
+>```go
+>func globrunqget(_p_ *p, max int32) *g {
+>    if sched.runqsize == 0 {
+>        return nil
+>    }
+>
+>
+>    n := sched.runqsize/gomaxprocs + 1
+>    if n > sched.runqsize {
+>        n = sched.runqsize
+>    }
+>    if max > 0 && n > max {
+>        n = max
+>    }
+>    if n > int32(len(_p_.runq))/2 {
+>        n = int32(len(_p_.runq)) / 2
+>    }
+>
+>
+>    sched.runqsize -= n
+>
+>
+>    gp := sched.runq.pop()
+>    n--
+>    for ; n > 0; n-- {
+>        gp1 := sched.runq.pop()
+>        runqput(_p_, gp1, false)
+>    }
+>    return gp
+>```
+>
+>（2）尝试从 p 本地队列中获取一个可执行的 goroutine
+>
+>```go
+> if gp, inheritTime := runqget(_p_); gp != nil {
+>        return gp, inheritTime, false
+>    }
+>func runqget(_p_ *p) (gp *g, inheritTime bool) {
+>    if next != 0 && _p_.runnext.cas(next, 0) {
+>        return next.ptr(), true
+>    }
+>
+>
+>
+>
+>    for {
+>        h := atomic.LoadAcq(&_p_.runqhead) // load-acquire, synchronize with other consumers
+>        t := _p_.runqtail
+>        if t == h {
+>            return nil, false
+>        }
+>        gp := _p_.runq[h%uint32(len(_p_.runq))].ptr()
+>        if atomic.CasRel(&_p_.runqhead, h, h+1) { // cas-release, commits consume
+>            return gp, false
+>        }
+>    }
+>```
+>
+>​	I. 倘若当前 p 的 runnext 非空，直接获取即可：
+>
+>```go
+>   if next != 0 && _p_.runnext.cas(next, 0) {
+>        return next.ptr(), true
+>    }
+>```
+>
+>​	II. 加锁从 p 的本地队列中获取 g.
+>
+>```go
+>for {
+>        h := atomic.LoadAcq(&_p_.runqhead) // load-acquire, synchronize with other consumers
+>       // ...
+>   }
+>```
+>
+>​	需要注意，虽然本地队列是属于 p 独有的，但是由于 work-stealing 机制的存在，其他 p 可能会前来执行窃取动作，因此操作仍需加锁.
+>
+>​	但是，由于窃取动作发生的频率不会太高，因此当前 p 取得锁的成功率是很高的，因此可以说p 的本地队列是接近于无锁化，但没有达到真正意义的无锁.
+>
+>​	III. 倘若本地队列为空，直接终止并返回；
+>
+>```go
+>     h := atomic.LoadAcq(&_p_.runqhead) // load-acquire, synchronize with other consumers
+>        t := _p_.runqtail
+>        if t == h {
+>            return nil, false
+>       }
+>```
+>
+>
+>
+>​	IV. 倘若本地队列存在 g，则取得队首的 g，解锁并返回.
+>
+>```go
+>       gp := _p_.runq[h%uint32(len(_p_.runq))].ptr()
+>        if atomic.CasRel(&_p_.runqhead, h, h+1) { // cas-release, commits consume
+>            return gp, false
+>       }
+>```
+>
+>（3）倘若本地队列没有可执行的 g，会从全局队列中获取：(加锁，尝试并从全局队列中取队首的元素)
+>
+>```go
+>   if sched.runqsize != 0 {
+>        lock(&sched.lock)
+>        gp := globrunqget(_p_, 0)
+>        unlock(&sched.lock)
+>        if gp != nil {
+>            return gp, false, false
+>        }
+>    }
+>```
+>
+>（4）倘若本地队列和全局队列都没有 g，则会获取准备就绪的网络协程：
+>
+>```go
+> if netpollinited() && atomic.Load(&netpollWaiters) > 0 && atomic.Load64(&sched.lastpoll) != 0 {
+>        if list := netpoll(0); !list.empty() { // non-blocking
+>            gp := list.pop()
+>            injectglist(&list)
+>            casgstatus(gp, _Gwaiting, _Grunnable)
+>            return gp, false, false
+>        }
+>  }
+>```
+>
+>（5）work-stealing
 
 #### Q8. 调度器的 work-stealing 机制
+
+当本地队列和全局队列都没有 g，并且当前p没有可运行的 Goroutine，从其他 p 中偷取 g
+
+```go
+func stealWork(now int64) (gp *g, inheritTime bool, rnow, pollUntil int64, newWork bool) {
+    pp := getg().m.p.ptr()
+
+
+    ranTimer := false
+
+//	偷取操作至多会遍历全局的 p 队列 4 次，过程中只要找到可窃取的 p 则会立即返回.
+
+//为保证窃取行为的公平性，遍历的起点是随机的. 
+    const stealTries = 4
+    for i := 0; i < stealTries; i++ {
+        stealTimersOrRunNextG := i == stealTries-1
+
+
+        for enum := stealOrder.start(fastrand()); !enum.done(); enum.next() {
+            // ...
+        }
+    }
+
+
+    return nil, false, now, pollUntil, ranTime
+```
+
+```go
+func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool) uint32 {
+    for {
+        // 每次对一个 p 尝试窃取前，会对其局部队列加锁；
+        h := atomic.LoadAcq(&_p_.runqhead) // load-acquire, synchronize with other consumers
+        t := atomic.LoadAcq(&_p_.runqtail) // load-acquire, synchronize with the producer
+        //尝试偷取其现有的一半 g，并且返回实际偷取的数量.
+        n := t - h
+        n = n - n/2
+        if n == 0 {
+            if stealRunNextG {
+                // Try to steal from _p_.runnext.
+                if next := _p_.runnext; next != 0 {
+                    if _p_.status == _Prunning {
+                        
+                        if GOOS != "windows" && GOOS != "openbsd" && GOOS != "netbsd" {
+                            usleep(3)
+                        } else {
+                            osyield()
+                        }
+                    }
+                    if !_p_.runnext.cas(next, 0) {
+                        continue
+                    }
+                    batch[batchHead%uint32(len(batch))] = next
+                    return 1
+                }
+            }
+            return 0
+        }
+        if n > uint32(len(_p_.runq)/2) { // read inconsistent h and t
+            continue
+        }
+        for i := uint32(0); i < n; i++ {
+            g := _p_.runq[(h+i)%uint32(len(_p_.runq))]
+            batch[(batchHead+i)%uint32(len(batch))] = g
+        }
+        if atomic.CasRel(&_p_.runqhead, h, h+n) { // cas-release, commits consume
+            return n
+        }
+    }
+}
+```
+
+![image-20230715231941751](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/image-20230715231941751.png)
 
 
 
 #### Q9. 执行 goroutine 逻辑
 
+![b7700a40d929858747093d7775904d43](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/b7700a40d929858747093d7775904d43.png)
 
+>（1）更新 g 的状态信息，建立 g 与 m 之间的绑定关系；
+>
+>（2）更新 p 的总调度次数；
+>
+>（3）调用 gogo 方法，执行 goroutine 中的任务.
+>
+>```go
+>func execute(gp *g, inheritTime bool) {
+>    _g_ := getg()
+>
+>
+>    _g_.m.curg = gp
+>    gp.m = _g_.m
+>    casgstatus(gp, _Grunnable, _Grunning)
+>    gp.waitsince = 0
+>    gp.preempt = false
+>    gp.stackguard0 = gp.stack.lo + _StackGuard
+>    if !inheritTime {
+>        _g_.m.p.ptr().schedtick++
+>    }
+>
+>
+>    gogo(&gp.sched) 
+>```
+>
+>
 
 #### Q10. 主动让渡与被动阻塞/调度结束与抢占调度
 
+g 执行主动让渡时，会调用 mcall 方法将执行权归还给 g0，并由 g0 调用 gosched_m 方法进行解绑/状态转换等操作
 
+![ccb22d725b5da191eae03aea41caee56](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/ccb22d725b5da191eae03aea41caee56.png)
+
+```go
+func Gosched() {
+    // ...
+    mcall(gosched_m)
+}
+func gosched_m(gp *g) {
+    goschedImpl(gp)
+}
+
+
+func goschedImpl(gp *g) {
+    status := readgstatus(gp)
+    if status&^_Gscan != _Grunning {
+        dumpgstatus(gp)
+        throw("bad g status")
+    }
+    //将当前 g 的状态由执行中切换为待执行 _Grunnable：
+    casgstatus(gp, _Grunning, _Grunnable) 
+    //调用 dropg() 方法，将当前的 m 和 g 解绑；
+    dropg()
+    lock(&sched.lock)
+    //将 g 添加到全局队列当中
+    globrunqput(gp)
+    unlock(&sched.lock)
+	//开启新一轮的调度
+    schedule()
+```
+
+g 需要被动调度时，会调用 mcall 方法切换至 g0，并调用 park_m 方法将 g 置为阻塞态
+
+![图片](https://mmbiz.qpic.cn/mmbiz_png/3ic3aBqT2ibZv7BArqKhicntmW5bZrgickiaguTPjUX0icRicMBwF5uwbylRHAxItjK05Ml5vZo4icYhGVS8hgBsiaylHyw/640?wx_fmt=png&tp=wxpic&wxfrom=5&wx_lazy=1&wx_co=1)
+
+```go
+func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer, reason waitReason, traceEv byte, traceskip int) {
+    // ...
+    mcall(park_m)
+}
+
+func park_m(gp *g) {
+    _g_ := getg()
+
+	//（1）将当前 g 的状态由 running 改为 waiting；
+    casgstatus(gp, _Grunning, _Gwaiting)
+    // （2）将 g 与 m 解绑；
+    dropg()
+
+
+    // （3）执行新一轮的调度 schedule.
+    schedule()
+```
+
+当因被动调度陷入阻塞态的 g 需要被唤醒时，会由其他 g 负责将 g 的状态由 waiting 改为 runnable，然后会将其添加到唤醒者的 p 的本地队列中
+
+```go
+func goready(gp *g, traceskip int) {
+    systemstack(func() {
+        ready(gp, traceskip, true)
+    })
+}
+
+func ready(gp *g, traceskip int, next bool) {
+    // ...
+    _g_ := getg()
+    // （1）先将 g 的状态从阻塞态改为可执行的状态；
+    casgstatus(gp, _Gwaiting, _Grunnable)
+    // （2）调用 runqput 将当前 g 添加到唤醒者 p 的本地队列中，如果队列满了，会连带 g 一起将一半的元素转移到全局队列.
+    runqput(_g_.m.p.ptr(), gp, next)
+    // ...
+}
+```
+
+当 g 执行完成时，会先执行 mcall 方法切换至 g0，然后调用 goexit0 方法,以结束自己的生命周期
+
+![图片](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/640)
+
+
+
+```go
+func goexit1() {
+    // ...
+    mcall(goexit0)
+}
+func goexit0(gp *g) {
+    _g_ := getg()
+    _p_ := _g_.m.p.ptr()
+
+	//（1）将 g 状态置为 dead；
+    casgstatus(gp, _Grunning, _Gdead)
+    // ...
+    gp.m = nil
+    // ...
+
+	//（2）解绑 g 和 m；
+    dropg()
+
+
+    // （3）开启新一轮的调度.
+    schedule()
+```
+
+
+
+####  Q11. 两种g的转换
+
+goroutine 的类型可分为两类：
+
+I.  负责调度普通 g 的 g0，执行固定的调度流程，与 m 的关系为一对一；
+
+II.  负责执行用户函数的普通 g.
+
+m 通过 p 调度执行的 goroutine 永远在普通 g 和 g0 之间进行切换，当 g0 找到可执行的 g 时，会调用 gogo 方法，调度 g 执行用户定义的任务；当 g 需要主动让渡或被动调度时，会触发 mcall 方法，将执行权重新交还给 g0.
+
+![图片](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/640)
+
+gogo 和 mcall 可以理解为对偶关系
+
+#### Q12. 系统调用前后
+
+在 m 需要执行系统调用前，会先执行位于 runtime/proc.go 的 reentersyscall 的方法
+
+```go
+//这段代码是 Go 语言中的系统调用处理函数 reentersyscall，它用于将当前 goroutine 从用户态切换到内核态，执行系统调用,并将当前 goroutine 所在的 P 的状态修改为 _Psyscall。
+
+1. 获取当前 goroutine 的 G 结构体指针 _g_。
+
+2. 调用 save 函数保存当前 goroutine 的程序计数器 pc 和栈指针 sp。
+
+3. 将当前 goroutine 的 syscallpc 和 syscallsp 字段设置为 pc 和 sp。
+
+4. 将当前 goroutine 的状态从 _Grunning（运行状态）修改为 _Gsyscall（系统调用状态）。
+
+5. 获取当前 goroutine 所在的 P 结构体指针 pp。
+
+6. 将当前 goroutine 所在的 M 结构体的 p 字段设置为 0，表示当前 goroutine 不再运行在任何一个 P 上。
+
+7. 将当前 goroutine 所在的 P 结构体的 m 字段设置为 0，表示当前 P 不再运行任何一个 goroutine。
+
+8. 将当前 P 的状态从 _Prunning（运行状态）修改为 _Psyscall（系统调用状态）。
+func reentersyscall(pc, sp uintptr) {
+    _g_ := getg()
+
+
+    // ...
+    save(pc, sp)
+    _g_.syscallsp = sp
+    _g_.syscallpc = pc
+    casgstatus(_g_, _Grunning, _Gsyscall)
+    // ...
+
+
+    pp := _g_.m.p.ptr()
+    pp.m = 0
+    _g_.m.oldp.set(pp)
+    _g_.m.p = 0
+    atomic.Store(&pp.status, _Psyscall)
+    // ...
+```
+
+当 m 完成了内核态的系统调用之后，此时会步入位于 runtime/proc.go 的 exitsyscall 函数中，尝试寻找 p 重新开始运作：
+
+```go
+这段代码是 Go 语言中的系统调用处理函数 exitsyscall，它用于将当前 goroutine 从内核态切换回用户态，结束系统调用，并重新调度 goroutine。
+
+1. 获取当前 goroutine 的 G 结构体指针 _g_。
+
+2. 调用 exitsyscallfast 函数尝试快速结束系统调用。如果快速结束成功，则将当前 goroutine 的状态从 _Gsyscall（系统调用状态）修改为 _Grunning（运行状态），并直接返回。
+
+3. 如果快速结束失败，则调用 mcall 函数，将当前 goroutine 所在的 M 结构体的 curg 字段设置为 _g_，然后调用 exitsyscall0 函数结束系统调用。
+
+4. 在 exitsyscall0 函数中，将当前 goroutine 的状态从 _Gsyscall（系统调用状态）修改为 _Grunning（运行状态），然后调用 schedule 函数重新调度 goroutine。
+
+func exitsyscall() {
+    _g_ := getg()
+    
+    // ...
+    if exitsyscallfast(oldp) {
+        // ...
+        casgstatus(_g_, _Gsyscall, _Grunning)
+        // ...
+        return
+    }
+
+
+    // ...
+    mcall(exitsyscall0)
+    // ...
+}
+这段代码是 Go 语言中的系统调用处理函数 exitsyscall0，它用于结束系统调用并重新调度 goroutine，以便让其他 goroutine 能够充分利用 CPU 资源。
+
+
+1. 将当前 goroutine 的状态从 _Gsyscall（系统调用状态）修改为 _Grunnable（可运行状态）。
+
+2. 调用 dropg 函数将当前 goroutine 从当前 M 的 curg 字段中移除以并解绑 g 和 m 的关系：
+
+3. 获取调度器的全局锁，并尝试获取一个空闲的 P。
+
+4. 如果成功获取到一个空闲的 P，则将当前 goroutine 添加到该 P 的本地队列中，并调用 execute 函数执行该 goroutine。由于 execute 函数永远不会返回，因此这个 goroutine 将一直运行在该 P 上。
+
+5. 如果没有获取到空闲的 P，则将当前 goroutine 添加到全局队列中，等待其他 P 的工作窃取。
+
+6. 释放调度器的全局锁。
+
+7. 调用 stopm 函数将当前 M 的状态设置为 _Mdead（死亡状态）。
+
+8. 调用 schedule 函数重新调度 goroutine。由于 schedule 函数永远不会返回，因此这个 goroutine 将一直运行在某个 P 上。
+
+func exitsyscall0(gp *g) {
+    casgstatus(gp, _Gsyscall, _Grunnable)
+    dropg()
+    lock(&sched.lock)
+    var _p_ *p
+    if schedEnabled(gp) {
+        _p_, _ = pidleget(0)
+    }
+    
+    var locked bool
+    if _p_ == nil {
+        globrunqput(gp)
+    } 
+    
+    unlock(&sched.lock)
+    if _p_ != nil {
+        acquirep(_p_)
+        execute(gp, false) // Never returns.
+    }
+    
+    // ...
+    
+    stopm()
+    schedule() // Never returns.
+}
+```
 
 
 
