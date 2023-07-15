@@ -297,7 +297,7 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
     // ...
 ```
 
-![图片](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/640)
+![](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/20230716010623.png)
 
 ##### CASE2. 写时无阻塞读协程但环形缓冲区仍有空间
 
@@ -324,7 +324,7 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 }
 ```
 
-![图片](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/640)
+![](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/20230716010644.png)
 
 ##### CASE3. 写时无阻塞读协程且环形缓冲区无空间(阻塞当前写协程)
 
@@ -357,7 +357,7 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 }
 ```
 
-![图片](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/640)
+![](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/20230716010715.png)
 
 ##### 写流程整体
 
@@ -572,7 +572,5 @@ func closechan(c *hchan) {
         gp.schedlink = 0
         goready(gp, 3)
 ```
-
-
 
 ![](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/20230716005131.png)

@@ -539,7 +539,7 @@ func ready(gp *g, traceskip int, next bool) {
 
 当 g 执行完成时，会先执行 mcall 方法切换至 g0，然后调用 goexit0 方法,以结束自己的生命周期
 
-![图片](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/640)
+![](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/20230716010433.png)
 
 
 
@@ -578,7 +578,7 @@ II.  负责执行用户函数的普通 g.
 
 m 通过 p 调度执行的 goroutine 永远在普通 g 和 g0 之间进行切换，当 g0 找到可执行的 g 时，会调用 gogo 方法，调度 g 执行用户定义的任务；当 g 需要主动让渡或被动调度时，会触发 mcall 方法，将执行权重新交还给 g0.
 
-![图片](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/640)
+
 
 gogo 和 mcall 可以理解为对偶关系
 
