@@ -164,160 +164,21 @@ type m struct {
    ...
 }
 type p struct {
-	id          int32
-	status      uint32 // one of pidle/prunning/...
-	link        puintptr
-	schedtick   uint32     // incremented on every scheduler call
-	syscalltick uint32     // incremented on every system call
-	sysmontick  sysmontick // last tick observed by sysmon
-	m           muintptr   // back-link to associated m (nil if idle)
-	mcache      *mcache
-	pcache      pageCache
-	raceprocctx uintptr
+	...
 
-	deferpool    []*_defer // pool of available defer structs (see panic.go)
-	deferpoolbuf [32]*_defer
-
-	// Cache of goroutine ids, amortizes accesses to runtime·sched.goidgen.
-	goidcache    uint64
-	goidcacheend uint64
-
-	// Queue of runnable goroutines. Accessed without lock.
+	// 本地队列设置
+    //在 Go 语言中，p 表示一个处理器（processor），它负责调度和执行 goroutine。每个 p 都有一个 runqhead、runqtail 和 runq 字段，它们用于存储当前 p 上的可运行 goroutine 队列。
+	//具体来说，runqhead 和 runqtail 是两个指向 runq 数组中可运行 goroutine 的队列头和队列尾的指针。runq 数组是一个长度为 256 的数组，用于存储可运行 goroutine 的指针。当一个 goroutine 可以运行时，它会被添加到当前 p 的 runq 队列中，等待被调度器调度执行。当调度器需要选择一个 goroutine 运行时，它会从当前 p 的 runq 队列中选择一个可运行的 goroutine 运行。
+	//在 Go 语言中，runqhead、runqtail 和 runq 字段是非常重要的字段，它们与调度器密切相关，对于 Go 语言的运行时环境非常重要。通过这些字段，调度器可以快速地选择一个可运行的 goroutine 运行，从而实现了高效的并发调度
 	runqhead uint32
 	runqtail uint32
 	runq     [256]guintptr
-	// runnext, if non-nil, is a runnable G that was ready'd by
-	// the current G and should be run next instead of what's in
-	// runq if there's time remaining in the running G's time
-	// slice. It will inherit the time left in the current time
-	// slice. If a set of goroutines is locked in a
-	// communicate-and-wait pattern, this schedules that set as a
-	// unit and eliminates the (potentially large) scheduling
-	// latency that otherwise arises from adding the ready'd
-	// goroutines to the end of the run queue.
-	//
-	// Note that while other P's may atomically CAS this to zero,
-	// only the owner P can CAS it to a valid G.
+	// 在 Go 语言中，p 表示一个处理器（processor），它负责调度和执行 goroutine。p 结构体中的 runnext 字段是一个指向 g（goroutine）结构体的指针，它表示下一个要运行的 goroutine。
+	//具体来说，如果 runnext 不为 nil，则表示当前 goroutine 已经准备好了一个可运行的 goroutine，并且应该在当前 goroutine 的时间片还没有用完的情况下运行。这个可运行的 goroutine 将继承当前时间片中剩余的时间。如果一组 goroutine 被锁定在一个通信和等待模式中，那么这个模式将作为一个单元进行调度，从而消除了将准备好的 goroutine 添加到运行队列末尾时可能出现的（潜在的大量的）调度延迟。
+    //需要注意的是，虽然其他 P 可以原子地将 runnext 设置为零，但只有所有者 P 才能将其设置为有效的 goroutine。这是因为 runnext 字段只能由当前 goroutine 来设置，其他 goroutine 不能修改它。
 	runnext guintptr
 
-	// Available G's (status == Gdead)
-	gFree struct {
-		gList
-		n int32
-	}
-
-	sudogcache []*sudog
-	sudogbuf   [128]*sudog
-
-	// Cache of mspan objects from the heap.
-	mspancache struct {
-		// We need an explicit length here because this field is used
-		// in allocation codepaths where write barriers are not allowed,
-		// and eliminating the write barrier/keeping it eliminated from
-		// slice updates is tricky, moreso than just managing the length
-		// ourselves.
-		len int
-		buf [128]*mspan
-	}
-
-	tracebuf traceBufPtr
-
-	// traceSweep indicates the sweep events should be traced.
-	// This is used to defer the sweep start event until a span
-	// has actually been swept.
-	traceSweep bool
-	// traceSwept and traceReclaimed track the number of bytes
-	// swept and reclaimed by sweeping in the current sweep loop.
-	traceSwept, traceReclaimed uintptr
-
-	palloc persistentAlloc // per-P to avoid mutex
-
-	// The when field of the first entry on the timer heap.
-	// This is 0 if the timer heap is empty.
-	timer0When atomic.Int64
-
-	// The earliest known nextwhen field of a timer with
-	// timerModifiedEarlier status. Because the timer may have been
-	// modified again, there need not be any timer with this value.
-	// This is 0 if there are no timerModifiedEarlier timers.
-	timerModifiedEarliest atomic.Int64
-
-	// Per-P GC state
-	gcAssistTime         int64 // Nanoseconds in assistAlloc
-	gcFractionalMarkTime int64 // Nanoseconds in fractional mark worker (atomic)
-
-	// limiterEvent tracks events for the GC CPU limiter.
-	limiterEvent limiterEvent
-
-	// gcMarkWorkerMode is the mode for the next mark worker to run in.
-	// That is, this is used to communicate with the worker goroutine
-	// selected for immediate execution by
-	// gcController.findRunnableGCWorker. When scheduling other goroutines,
-	// this field must be set to gcMarkWorkerNotWorker.
-	gcMarkWorkerMode gcMarkWorkerMode
-	// gcMarkWorkerStartTime is the nanotime() at which the most recent
-	// mark worker started.
-	gcMarkWorkerStartTime int64
-
-	// gcw is this P's GC work buffer cache. The work buffer is
-	// filled by write barriers, drained by mutator assists, and
-	// disposed on certain GC state transitions.
-	gcw gcWork
-
-	// wbBuf is this P's GC write barrier buffer.
-	//
-	// TODO: Consider caching this in the running G.
-	wbBuf wbBuf
-
-	runSafePointFn uint32 // if 1, run sched.safePointFn at next safe point
-
-	// statsSeq is a counter indicating whether this P is currently
-	// writing any stats. Its value is even when not, odd when it is.
-	statsSeq atomic.Uint32
-
-	// Lock for timers. We normally access the timers while running
-	// on this P, but the scheduler can also do it from a different P.
-	timersLock mutex
-
-	// Actions to take at some time. This is used to implement the
-	// standard library's time package.
-	// Must hold timersLock to access.
-	timers []*timer
-
-	// Number of timers in P's heap.
-	numTimers atomic.Uint32
-
-	// Number of timerDeleted timers in P's heap.
-	deletedTimers atomic.Uint32
-
-	// Race context used while executing timer functions.
-	timerRaceCtx uintptr
-
-	// maxStackScanDelta accumulates the amount of stack space held by
-	// live goroutines (i.e. those eligible for stack scanning).
-	// Flushed to gcController.maxStackScan once maxStackScanSlack
-	// or -maxStackScanSlack is reached.
-	maxStackScanDelta int64
-
-	// gc-time statistics about current goroutines
-	// Note that this differs from maxStackScan in that this
-	// accumulates the actual stack observed to be used at GC time (hi - sp),
-	// not an instantaneous measure of the total stack size that might need
-	// to be scanned (hi - lo).
-	scannedStackSize uint64 // stack size of goroutines scanned by this P
-	scannedStacks    uint64 // number of goroutines scanned by this P
-
-	// preempt is set to indicate that this P should be enter the
-	// scheduler ASAP (regardless of what G is running on it).
-	preempt bool
-
-	// pageTraceBuf is a buffer for writing out page allocation/free/scavenge traces.
-	//
-	// Used only if GOEXPERIMENT=pagetrace.
-	pageTraceBuf pageTraceBuf
-
-	// Padding is no longer needed. False sharing is now not a worry because p is large enough
-	// that its size class is an integer multiple of the cache line size (for any of our architectures).
+ 	...
 }
 ```
 
