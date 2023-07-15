@@ -12,6 +12,73 @@
 >   (4) 写出真实代码，不能有死锁或者 panic 风险
 
 ```go
+type ImproveChannel struct {
+	sync.Once //确保只关闭一次
+	ch        chan struct{}
+}
+
+func NewImproveChannel() *ImproveChannel {
+	return &ImproveChannel{
+		ch: make(chan struct{}),
+	}
+}
+
+func (channel *ImproveChannel) Close() {
+	channel.Once.Do(func() {
+		close(channel.ch)
+	})
+}
+
+type ConcurrentMap struct {
+	m          map[string]string
+	improveCh  map[string]*ImproveChannel
+	sync.Mutex //互斥锁
+}
+
+func NewConcurrentMap() *ConcurrentMap {
+	return &ConcurrentMap{
+		m:         make(map[string]string),
+		improveCh: make(map[string]*ImproveChannel),
+	}
+}
+
+func (concurrentMap *ConcurrentMap) Put(key string, val string) {
+	concurrentMap.Lock()
+	defer concurrentMap.Unlock()
+	concurrentMap.m[key] = val
+	channel, ok := concurrentMap.improveCh[key]
+	if !ok {
+		return
+	}
+	channel.Close()
+}
+
+func (concurrentMap *ConcurrentMap) Get(key string, maxWaitDuration time.Duration) (string, error) {
+	concurrentMap.Lock()
+	val, ok := concurrentMap.m[key]
+	if ok {
+		concurrentMap.Unlock()
+		return val, nil
+	}
+	channel, ok := concurrentMap.improveCh[key]
+	// 不存在则创建新的channel
+	if !ok {
+		channel = NewImproveChannel()
+		concurrentMap.improveCh[key] = channel
+	}
+	ctx, cannel := context.WithTimeout(context.Background(), maxWaitDuration)
+	defer cannel()
+	concurrentMap.Unlock()
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-channel.ch:
+	}
+	concurrentMap.Lock()
+	val = concurrentMap.m[key]
+	concurrentMap.Unlock()
+	return val, nil
+}
 
 ```
 
@@ -350,3 +417,162 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 }
 ```
 
+![](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/20230716004151.png)
+
+##### CASE4. 读时无阻塞写协程且缓冲区有元素
+
+```GO
+func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool) {
+    // ...
+    lock(&c.lock)
+    // ...
+    if c.qcount > 0 {
+        // 获取到 recvx 对应位置的元素
+        qp := chanbuf(c, c.recvx)
+        if ep != nil {
+            typedmemmove(c.elemtype, ep, qp)
+        }
+        typedmemclr(c.elemtype, qp)
+        // 更新channel属性
+        c.recvx++
+        if c.recvx == c.dataqsiz {
+            c.recvx = 0
+        }
+        c.qcount--
+        unlock(&c.lock)
+        return true, true
+    }
+    // ...
+```
+
+![](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/20230716004327.png)
+
+##### CASE5. 读时无阻塞写协程且缓冲区无元素
+
+```GO
+func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool) {
+   // ...
+   lock(&c.lock)
+   // ...
+    gp := getg()
+    //构造封装当前 goroutine 的 sudog 对象
+    mysg := acquireSudog()
+    mysg.elem = ep
+    //完成指针指向，建立 sudog、goroutine、channel 之间的指向关系
+    gp.waiting = mysg
+    mysg.g = gp
+    mysg.c = c
+    gp.param = nil
+    //把 sudog 添加到当前 channel 的阻塞读协程队列中
+    c.recvq.enqueue(mysg)
+    atomic.Store8(&gp.parkingOnChan, 1)
+    //park 当前协程
+    gopark(chanparkcommit, unsafe.Pointer(&c.lock), 
+    waitReasonChanReceive, traceEvGoBlockRecv, 2)
+	//倘若协程从 park 中被唤醒，则回收 sudog（sudog能被唤醒，其对应的元素必然已经被写入）
+    gp.waiting = nil
+    success := mysg.success
+    gp.param = nil
+    mysg.c = nil
+    releaseSudog(mysg)
+    return true, success
+}
+```
+
+![](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/20230716004656.png)
+
+##### 读流程整体
+
+![](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/20230716004725.png)
+
+#### Q5. 非阻塞模式
+
+>非阻塞模式下，读/写 channel 方法通过一个 bool 型的响应参数，用以标识是否读取/写入成功.
+>
+>• 所有需要使得当前 goroutine 被挂起的操作，在非阻塞模式下都会返回 false；
+>
+>• 所有是的当前 goroutine 会进入死锁的操作，在非阻塞模式下都会返回 false；
+>
+>• 所有能立即完成读取/写入操作的条件下，非阻塞模式下会返回 true.
+
+默认情况下，读/写 channel 都是阻塞模式，只有在**select** 语句组成的多路复用分支中，与 channel 的交互会变成非阻塞模式：
+
+```go
+ch := make(chan int)
+select{
+  case <- ch:
+  default:
+}
+```
+
+#### Q6.  两种读 channel 的协议
+
+读取 channel 时，可以根据第二个 bool 型的返回值用以判断当前 channel 是否已处于关闭状态（零值判断）：
+
+```GO
+ch := make(chan int, 2)
+got1 := <- ch
+got2,ok := <- ch
+```
+
+#### Q7.  关闭channel
+
+```go
+func closechan(c *hchan) {
+    // 关闭未初始化过的 channel 会 panic
+    if c == nil {
+        panic(plainError("close of nil channel"))
+    }
+
+    lock(&c.lock)
+    //重复关闭 channel 会 panic
+    if c.closed != 0 {
+        unlock(&c.lock)
+        panic(plainError("close of closed channel"))
+    }
+
+    c.closed = 1
+
+    var glist gList
+     //将阻塞读协程队列中的协程节点统一添加到 glist
+    // release all readers
+    for {
+        sg := c.recvq.dequeue()
+        if sg == nil {
+            break
+        }
+
+        if sg.elem != nil {
+            typedmemclr(c.elemtype, sg.elem)
+            sg.elem = nil
+        }
+        gp := sg.g
+        gp.param = unsafe.Pointer(sg)
+        sg.success = false
+        glist.push(gp)
+    }
+	//将阻塞写协程队列中的协程节点统一添加到 glist
+    // release all writers (they will panic)
+    for {
+        sg := c.sendq.dequeue()
+        if sg == nil {
+            break
+        }
+        sg.elem = nil
+        gp := sg.g
+        gp.param = unsafe.Pointer(sg)
+        sg.success = false
+        glist.push(gp)
+    }
+    unlock(&c.lock)
+
+    // 唤醒 glist 当中的所有协程
+    for !glist.empty() {
+        gp := glist.pop()
+        gp.schedlink = 0
+        goready(gp, 3)
+```
+
+
+
+![](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/20230716005131.png)
