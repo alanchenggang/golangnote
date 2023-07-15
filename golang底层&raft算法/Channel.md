@@ -184,3 +184,169 @@ func makechan(t *chantype, size int) *hchan {
 ```
 
 ####  Q3.Channel的写流程
+
+##### channel写两类异常情况处理
+
+```go
+func chansend1(c *hchan, elem unsafe.Pointer) {
+    chansend(c, elem, true, getcallerpc())
+}
+
+func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
+    //对于未初始化的 chan，写入操作会引发死锁；
+    if c == nil {
+        gopark(nil, nil, waitReasonChanSendNilChan, traceEvGoStop, 2)
+        throw("unreachable")
+    }
+
+    lock(&c.lock)
+	//对于已关闭的 chan，写入操作会引发 panic.
+    if c.closed != 0 {
+        unlock(&c.lock)
+        panic(plainError("send on closed channel"))
+    }
+    
+    // ...
+```
+
+##### CASE1. 写时存在阻塞读协程
+
+```GO
+func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
+    // ...
+	//加锁
+    lock(&c.lock)
+
+    // ...
+	//从阻塞度协程队列中取出一个 goroutine 的封装对象 sudog
+    if sg := c.recvq.dequeue(); sg != nil {
+        // Found a waiting receiver. We pass the value we want to send
+        // directly to the receiver, bypassing the channel buffer (if any).
+        //在 send 方法中，会基于 memmove 方法，直接将元素拷贝交给 sudog 对应的 goroutine 在 send 方法中会完成解锁动作.
+        send(c, sg, ep, func() { unlock(&c.lock) }, 3)
+        return true
+    }
+    
+    // ...
+```
+
+![图片](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/640)
+
+##### CASE2. 写时无阻塞读协程但环形缓冲区仍有空间
+
+```GO
+func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
+    // 加锁
+    lock(&c.lock)
+    // ...
+    if c.qcount < c.dataqsiz {
+        // 将当前元素添加到环形缓冲区 sendx 对应的位置.
+        qp := chanbuf(c, c.sendx)
+        typedmemmove(c.elemtype, qp, ep)
+        // 更新channel参数
+        c.sendx++
+        if c.sendx == c.dataqsiz {
+            c.sendx = 0
+        }
+        c.qcount++
+        unlock(&c.lock)
+        return true
+    }
+
+    // ...
+}
+```
+
+![图片](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/640)
+
+##### CASE3. 写时无阻塞读协程且环形缓冲区无空间(阻塞当前写协程)
+
+```GO
+func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
+    // 加锁
+    lock(&c.lock)
+
+    // 构造封装当前 goroutine 的 sudog 对象
+    gp := getg()
+    mysg := acquireSudog()
+    mysg.elem = ep
+    mysg.g = gp
+    mysg.c = c
+    //完成指针指向，建立 sudog、goroutine、channel 之间的指向关系
+    gp.waiting = mysg
+    //把 sudog 添加到当前 channel 的阻塞写协程队列中
+    c.sendq.enqueue(mysg)
+    //park 当前协程
+    atomic.Store8(&gp.parkingOnChan, 1)
+    gopark(chanparkcommit, unsafe.Pointer(&c.lock), waitReasonChanSend, traceEvGoBlockSend, 2)
+    //倘若协程从 park 中被唤醒，则回收 sudog（sudog能被唤醒，其对应的元素必然已经被读协程取走）
+    gp.waiting = nil
+    closed := !mysg.success
+    gp.param = nil
+    mysg.c = nil
+    releaseSudog(mysg)
+    //解锁，返回
+    return true
+}
+```
+
+![图片](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/640)
+
+##### 写流程整体
+
+![](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/20230716002830.png)
+
+#### Q4. 读流程
+
+##### CASE1. 读空 channel
+
+```GO
+func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool) {
+    if c == nil {
+        // park 挂起，引起死锁
+        gopark(nil, nil, waitReasonChanReceiveNilChan, traceEvGoStop, 2)
+        throw("unreachable")
+    }
+    // ...
+}
+```
+
+##### CASE2. channel 已关闭且内部无元素
+
+```GO
+unc chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool) {
+  
+    lock(&c.lock)
+//直接解锁返回
+    if c.closed != 0 {
+        if c.qcount == 0 {
+            unlock(&c.lock)
+            if ep != nil {
+                typedmemclr(c.elemtype, ep)
+            }
+            return true, false
+        }
+        // The channel has been closed, but the channel's buffer have data.
+    } 
+
+    // ...
+```
+
+##### CASE3. 读时有阻塞的写协程
+
+```GO
+func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool) {
+   
+    lock(&c.lock)
+
+    //从阻塞写协程队列中获取到一个写协程
+    if sg := c.sendq.dequeue(); sg != nil {
+        //倘若 channel 无缓冲区，则直接读取写协程元素，并唤醒写协程
+        // 倘若 channel 有缓冲区，则读取缓冲区头部元素，并将写协程元素写入缓冲区尾部后唤醒写协程
+        recv(c, sg, ep, func() { unlock(&c.lock) }, 3)
+        return true, true
+     }
+     // ...
+}
+```
+
