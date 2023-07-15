@@ -44,9 +44,11 @@ g-->goroutine
 
 m-->machine
 
+>golang中线程的抽象
 >
+>m不直接执行g，而是先和p绑定，由其实现代理
 >
->
+>因为p的存在，m无需和g绑定，也无需记录g的状态信息，因此g在全生命周期中可以实现跨m执行
 
 p -->processor
 
