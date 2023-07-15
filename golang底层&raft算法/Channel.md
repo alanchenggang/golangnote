@@ -1,3 +1,5 @@
+![img](https://oscimg.oschina.net/oscnet/up-44f9427f2b61f085b9326ae3cf514a73e2c.JPEG)
+
 ## 场景
 
 >一道考题
@@ -129,7 +131,6 @@ type sudog struct {
 ```go
 func makechan(t *chantype, size int) *hchan {
 	elem := t.elem
-
 	// compiler checks this but be safe.
 	if elem.size >= 1<<16 {
 		throw("makechan: invalid channel element type")
