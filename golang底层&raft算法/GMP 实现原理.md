@@ -180,6 +180,20 @@ type p struct {
 
  	...
 }
+
+// 全局队列
+type schedt struct {
+	...
+	lock mutex // 通过互斥锁保证资源安全访问
+
+	// Global runnable queue.
+    // 全局队列设置
+	runq     gQueue
+	runqsize int32
+
+	...
+}
+
 ```
 
 
