@@ -34,6 +34,8 @@ func Test_sync_map(t *testing.T) {
 
 #### Q2. 数据结构
 
+![image-20230719002704990](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/image-20230719002704990.png)
+
 以空间换时间的策略冗余出一个map
 
 一个map只读(无锁化),另外一个map可读可写(加锁)
@@ -110,12 +112,238 @@ type entry struct {
     // 1. 存活态: p正常指向元素;
     // 2. 软删除: p指向nil;(逻辑上删除)
     // 3. 硬删除态: p指向固定的全局变量 expunged
-    
-    // 如果 p == nil，则表示该 entry 已被删除，且 m.dirty == nil 或 m.dirty[key] == e
-    // 如果 p == expunged，则表示该 entry 已被删除，m.dirty != nil，且该 entry 在 m.dirty 中不存在
-    //否则，该 entry 是有效的，并记录在 m.read.m[key] 中，在 m.dirty != nil 的情况下，也记录在 m.dirty[key] 中。
-    // 可以通过原子替换为 nil 来删除 entry，当 m.dirty 被创建时，它将原子替换为 expunged 并将 m.dirty[key] 置为空。可以通过原子替换来更新 entry 的关联值，前提是 p != expunged。如果 p == expunged，则只有在首先设置 m.dirty[key] = e 以便使用 dirty 映射表查找该 entry 后，才能更新 entry 的关联值。
 	p atomic.Pointer[any]
 }
+```
+
+结构体"entry"包含以下字段：
+
+- "p"：指向存储在该键值对中的接口值（interface{} value）的指针。
+  - 如果"p"为nil，表示该键值对已被删除，此时可能有两种情况：
+    - 若"m.dirty"为nil，则该键值对被删除，且映射中的"m.dirty"为空或"m.dirty[key]"为当前键值对。
+    - 若"m.dirty"不为nil，则该键值对被删除，且映射中的"m.dirty"不包含该键值对。
+  - 如果"p"为"expunged"，表示该键值对已被删除，"m.dirty"不为nil，且映射中的"m.dirty"不包含该键值对。
+  - 否则，表示该键值对是有效的，并记录在"m.read.m[key]"中，如果"m.dirty"不为nil，还会记录在"m.dirty[key]"中。
+
+通过原子替换操作，可以将一个键值对从映射中删除，将其"p"字段替换为nil。当下次创建"m.dirty"时，它会原子性地将nil替换为"expunged"，并保持"m.dirty[key]"未设置。
+
+通过原子替换操作，可以更新一个键值对的关联值，前提是"p"不等于"expunged"。如果"p"等于"expunged"，则只有在首先设置"m.dirty[key] = e"以便使用脏映射（dirty map）进行查找时，才能更新键值对的关联值。
+
+#### Q3. 读流程
+
+![image-20230719003011128](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/image-20230719003011128.png)
+
+```go
+func (m *Map) Load(key any) (value any, ok bool) {
+    //调用 loadReadOnly() 方法获取一个只读的副本 read，该副本包含当前的映射数据和标志位。
+	read := m.loadReadOnly()
+    //从 read 中查找给定 key 对应的值 e。如果存在，则将 ok 设置为 true，否则为 false。
+	e, ok := read.m[key]
+    // 如果在 read 中没有找到该 key 并且标志位 amended 为真(当前只读map数据缺失)，则需要考虑从 dirty 映射中查找
+	if !ok && read.amended {
+		m.mu.Lock()
+		// Avoid reporting a spurious miss if m.dirty got promoted while we were
+		// blocked on m.mu. (If further loads of the same key will not miss, it's
+		// not worth copying the dirty map for this key.)
+        // double cherk 再次获取只读的副本 read，此时包含了最新的映射数据和标志位。
+		read = m.loadReadOnly()
+		e, ok = read.m[key]
+        // 如果在新的 read 中仍然没有找到该 key 并且标志位 amended 为真，则从 dirty 映射中查找
+		if !ok && read.amended {
+            //从 dirty 映射中查找给定 key 对应的值 e。如果找到，则将 ok 设置为 true。
+			e, ok = m.dirty[key]
+			// Regardless of whether the entry was present, record a miss: this key
+			// will take the slow path until the dirty map is promoted to the read
+			// map.
+            // 记录一次未命中操作，无论该键是否存在。这样可以确保该键会在之后的慢速路径中处理，直到 dirty 映射被提升为读取映射。 miss++
+			m.missLocked()
+		}
+		m.mu.Unlock()
+	}
+	if !ok {
+		return nil, false
+	}
+	return e.load()
+}
+
+func (m *Map) loadReadOnly() readOnly {
+     
+	if p := m.read.Load(); p != nil {
+		return *p
+	}
+	return readOnly{}
+}
+
+func (e *entry) load() (value any, ok bool) {
+   
+	p := e.p.Load()
+    // 检查 p 的值，如果它为 nil 或者等于 expunged（一个特殊的标记），则表示该值已被删除或未设置。
+	if p == nil || p == expunged {
+		return nil, false
+	}
+    //如果值存在且有效，则返回解引用后的值 *p 和 true，表示成功加载值。 
+	return *p, true
+}
+
+// Load atomically loads and returns the value stored in x.
+// Load 以原子方式加载并返回存储在 x 中的值。
+func (x *Pointer[T]) Load() *T { return (*T)(LoadPointer(&x.v)) }
+
+
+func (m *Map) missLocked() {
+	m.misses++
+    // 如果未命中计数器小于 dirty 映射的长度，表示还未达到触发条件，直接返回，不执行后续操作
+	if m.misses < len(m.dirty) {
+		return
+	}
+    // 将 dirty 映射转换为只读的 readOnly 结构体，并使用 Store 方法将其存储到 read 中。readOnly 结构体是映射的只读副本，用于并发安全的读取操作。
+	m.read.Store(&readOnly{m: m.dirty})
+    // 将 dirty 映射置为空，表示所有的写入操作都已经被转移到了 read 中。
+	m.dirty = nil
+    // m.misses = 0：将未命中计数器重置为 0，以便开始下一个计数周期
+	m.misses = 0
+}
+
+```
+
+#### Q4. 写流程
+
+![image-20230719004546765](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/image-20230719004546765.png)
+
+```GO
+// Store sets the value for a key.
+func (m *Map) Store(key, value any) {
+	_, _ = m.Swap(key, value)
+}
+
+//Swap 方法用于交换给定键的值，并返回交换前的旧值
+// 它首先在只读的 read 映射中查找给定的 key
+	//如果找到并成功交换值，则返回交换前的旧值和 true
+	//如果未找到该键或交换失败，则获取互斥锁，并重新检查 read 和 dirty 映射
+	//如果在其中任何一个映射中找到该键，并成功交换值，则返回交换前的旧值和 true
+	// 如果在两个映射中均未找到该键，则创建一个新的 dirty 映射，并将新的值添加到其中
+	// 最后，释放互斥锁，并返回旧值和加载状态
+
+// Swap swaps the value for a key and returns the previous value if any.
+// The loaded result reports whether the key was present.
+func (m *Map) Swap(key, value any) (previous any, loaded bool) {
+    // 利用ReadOnly 应对更新操作
+	read := m.loadReadOnly()
+	if e, ok := read.m[key]; ok {
+        // 调用 trySwap 方法尝试原子交换值，并返回新值 v 和是否成功交换的标志位。
+		if v, ok := e.trySwap(&value); ok {
+            // 如果新值 v 为 nil，表示交换失败，返回空值和 false。
+			if v == nil {
+				return nil, false
+			}
+			return *v, true
+		}
+	}
+
+	m.mu.Lock()
+    // 重新获取只读的副本 read，以确保操作最新的映射数据。
+	read = m.loadReadOnly()
+    // 再次检查给定的 key 是否存在于新的 read 中。
+	if e, ok := read.m[key]; ok {
+        // 存在在read中
+        // 如果 e 已被标记为删除（expunged），则调用 unexpungeLocked 方法将其恢复，并返回 true。
+		if e.unexpungeLocked() {
+			// The entry was previously expunged, which implies that there is a
+			// non-nil dirty map and this entry is not in it.
+            // 将 e 添加到 dirty 映射中，表示该键已从 read 中恢复
+			m.dirty[key] = e
+		}
+        // 调用 swapLocked 方法原子交换值，并返回交换前的旧值 v
+		if v := e.swapLocked(&value); v != nil {
+            //设置 loaded 为 true 表示成功加载旧值
+			loaded = true
+            //将旧值 *v 赋给 previous
+			previous = *v
+		}
+        // 如果在 read 中未找到该键，并且该键存在于 dirty 映射中，则执行后续逻辑
+	} else if e, ok := m.dirty[key]; ok {
+        // 调用 swapLocked 方法原子交换值，并返回交换前的旧值 v。如果交换成功，执行后续逻辑。
+		if v := e.swapLocked(&value); v != nil {
+			loaded = true
+			previous = *v
+		}
+        //如果在 read 和 dirty 中均未找到该键
+        // 说明是新增而不是更新
+	} else {
+        // 如果 read 的标志位 amended 为假，表示 dirty 映射为空/readonly 全量相等于dirty映射，需要创建一个新的 dirty 映射
+		if !read.amended {
+			// We're adding the first new key to the dirty map.
+			// Make sure it is allocated and mark the read-only map as incomplete.
+            // 拷贝map。
+			m.dirtyLocked()
+            // 将标志位 amended 设置为真，并将新的 read 存储到 Map 中。
+			m.read.Store(&readOnly{m: read.m, amended: true})
+		}
+        // 将新的 entry（包含新值）添加到 dirty 映射中。
+		m.dirty[key] = newEntry(value)
+	}
+	m.mu.Unlock()
+    //返回旧值 previous 和加载状态 loaded
+	return previous, loaded
+}
+
+// trySwap swaps a value if the entry has not been expunged.
+//
+// If the entry is expunged, trySwap returns false and leaves the entry
+// unchanged.
+func (e *entry) trySwap(i *any) (*any, bool) {
+	for {
+		p := e.p.Load()
+        // 如果 p 的值等于 expunged，表示该条目已被标记为硬删除
+		if p == expunged {
+			return nil, false
+		}
+        // if e.p.CompareAndSwap(p, i)：尝试使用原子比较并交换（CAS）操作将指针 p 替换为新值 i。
+		if e.p.CompareAndSwap(p, i) {
+			return p, true
+		}
+	}
+}
+
+
+// unexpungeLocked 可确保条目未标记为删除.
+//
+// 如果先前已删除该条目，则必须在M.MU解锁之前将其添加到dirty map 中
+//
+func (e *entry) unexpungeLocked() (wasExpunged bool) {
+	return e.p.CompareAndSwap(expunged, nil)
+}
+
+
+func (m *Map) dirtyLocked() {
+	if m.dirty != nil {
+		return
+	}
+
+	read := m.loadReadOnly()
+	m.dirty = make(map[any]*entry, len(read.m))
+    
+    // 瓶颈点:
+    //   规避使用情景:写(插入)多读少
+	for k, e := range read.m {
+        // 将软删除状态的数据更新为硬删除状态
+        // 只copy确切未删除的数据
+		if !e.tryExpungeLocked() {
+			m.dirty[k] = e
+		}
+	}
+}
+func (e *entry) tryExpungeLocked() (isExpunged bool) {
+	p := e.p.Load()
+     // 将软删除状态的数据更新为硬删除状态
+	for p == nil {
+		if e.p.CompareAndSwap(nil, expunged) {
+			return true
+		}
+		p = e.p.Load()
+	}
+	return p == expunged
+}
+
 ```
 
