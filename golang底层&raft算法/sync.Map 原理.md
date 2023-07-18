@@ -347,3 +347,169 @@ func (e *entry) tryExpungeLocked() (isExpunged bool) {
 
 ```
 
+![image-20230719011913587](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/image-20230719011913587.png)
+
+#### Q5. 删流程
+
+![image-20230719012225579](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/image-20230719012225579.png)
+
+```GO
+// Delete deletes the value for a key.
+func (m *Map) Delete(key any) {
+	m.LoadAndDelete(key)
+}
+
+
+// LoadAndDelete deletes the value for a key, returning the previous value if any.
+// The loaded result reports whether the key was present.
+func (m *Map) LoadAndDelete(key any) (value any, loaded bool) {
+    // 获取只读的副本 read，该副本包含当前的映射数据和标志位。
+	read := m.loadReadOnly()
+    // 从 read 中查找给定 key 对应的条目 e。如果存在，则将 ok 设置为 true，否则为 false。
+	e, ok := read.m[key]
+    // 如果在 read 中没有找到该 key 并且标志位 amended 为真，则需要考虑从 dirty 映射中查找。
+	if !ok && read.amended {
+		m.mu.Lock()
+        //再次获取只读的副本 read，此时包含了最新的映射数据和标志位。
+		read = m.loadReadOnly()
+		e, ok = read.m[key]
+        // 如果在新的 read 中仍然没有找到该 key 并且标志位 amended 为真，则从 dirty 映射中查找
+		if !ok && read.amended {
+            // 从 dirty 映射中查找给定 key 对应的条目 e。如果找到，则将 ok 设置为 true。
+			e, ok = m.dirty[key]
+            // 从 dirty 映射中删除给定 key，无论该键是否存在。
+			delete(m.dirty, key)
+			// Regardless of whether the entry was present, record a miss: this key
+			// will take the slow path until the dirty map is promoted to the read
+			// map.
+			m.missLocked()
+		}
+		m.mu.Unlock()
+	}
+    //  如果在 read 中找到该 key
+	if ok {
+        // 调用 delete 方法删除条目 e 并返回其值
+		return e.delete()
+	}
+	return nil, false
+}
+
+
+func (e *entry) delete() (value any, ok bool) {
+	for {
+		p := e.p.Load()
+		if p == nil || p == expunged {
+			return nil, false
+		}
+		if e.p.CompareAndSwap(p, nil) {
+			return *p, true
+		}
+	}
+}
+```
+
+#### Q6. 遍历流程
+
+![image-20230719012923614](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/image-20230719012923614.png)
+
+```go
+// Range calls f sequentially for each key and value present in the map.
+// If f returns false, range stops the iteration.
+//
+// Range does not necessarily correspond to any consistent snapshot of the Map's
+// contents: no key will be visited more than once, but if the value for any key
+// is stored or deleted concurrently (including by f), Range may reflect any
+// mapping for that key from any point during the Range call. Range does not
+// block other methods on the receiver; even f itself may call any method on m.
+//
+// Range may be O(N) with the number of elements in the map even if f returns
+// false after a constant number of calls.
+func (m *Map) Range(f func(key, value any) bool) {
+	// We need to be able to iterate over all of the keys that were already
+	// present at the start of the call to Range.
+	// If read.amended is false, then read.m satisfies that property without
+	// requiring us to hold m.mu for a long time.
+	read := m.loadReadOnly()
+	if read.amended {
+		// m.dirty contains keys not in read.m. Fortunately, Range is already O(N)
+		// (assuming the caller does not break out early), so a call to Range
+		// amortizes an entire copy of the map: we can promote the dirty copy
+		// immediately!
+        // dirty 覆盖 read 
+		m.mu.Lock()
+		read = m.loadReadOnly()
+		if read.amended {
+			read = readOnly{m: m.dirty}
+			m.read.Store(&read)
+			m.dirty = nil
+			m.misses = 0
+		}
+		m.mu.Unlock()
+	}
+
+    // 读取read 
+	for k, e := range read.m {
+		v, ok := e.load()
+		if !ok {
+			continue
+		}
+		if !f(k, v) {
+			break
+		}
+	}
+}
+
+```
+
+#### Q7. entry 的 expunged 态
+
+为什么需要使用 expunged 态来区分软硬删除呢？仅用 nil 一种状态来标识删除不可以吗？
+
+>首先需要明确，无论是软删除(nil)还是硬删除(expunged),都表示在逻辑意义上 key-entry 对已经从 sync.Map 中删除，nil 和 expunged 的区别在于：
+>
+>• 软删除态（nil）：read map 和 dirty map 在物理上仍保有该 key-entry 对，因此倘若此时需要对该 entry 执行写操作，可以直接 CAS 操作 (恢复)；
+>
+>• 硬删除态（expunged）：dirty map 中已经没有该 key-entry 对，倘若执行写操作，必须加锁（dirty map 必须含有全量 key-entry 对数据）.
+
+![image-20230719013527744](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/image-20230719013527744.png)
+
+设计 expunged 和 nil 两种状态的原因，就是为了优化在 dirtyLocked 前，针对同一个 key 先删后写的场景. 通过 expunged 态额外标识出 dirty map 中是否仍具有指向该 entry 的能力，这样能够实现对一部分 nil 态 key-entry 对的解放，能够基于 CAS 完成这部分内容写入操作而无需加锁
+
+#### Q8. read map 和 dirty map 的数据流转
+
+sync.Map 由两个 map 构成：
+
+- read map：访问时全程无锁；
+- dirty map：是兜底的读写 map，访问时需要加锁.
+
+之所以这样处理，是希望能根据对读、删、更新、写操作频次的探测，来实时动态地调整操作方式，希望在读、更新、删频次较高时，更多地采用 CAS 的方式无锁化地完成操作；在写操作频次较高时，则直接了当地采用加锁操作完成.
+
+因此， sync.Map 本质上采取了一种以空间换时间 + 动态调整策略的设计思路
+
+两个map的作用
+
+![image-20230719014018526](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/image-20230719014018526.png)
+
+- 总体思想，希望能多用 read map，少用 dirty map，因为操作前者无锁，后者需要加锁；
+
+- 除了 expunged 态的 entry 之外，read map 的内容为 dirty map 的子集；
+
+> dirty map -> read map
+
+![image-20230719014121751](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/image-20230719014121751.png)
+
+• 记录读/删流程中，通过 misses 记录访问 read map miss 由 dirty 兜底处理的次数，当 miss 次数达到阈值，则进入 missLocked 流程，进行新老 read/dirty 替换流程；此时将老 dirty 作为新 read，新 dirty map 则暂时为空，直到 dirtyLocked 流程完成对 dirty 的初始化；
+
+> read map -> dirty map
+
+![image-20230719014227964](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/image-20230719014227964.png)
+
+- 发生 dirtyLocked 的前置条件：I dirty 暂时为空（此前没有写操作或者近期进行过 missLocked 流程）；II 接下来一次写操作访问 read 时 miss，需要由 dirty 兜底；
+- 在 dirtyLocked 流程中，需要对 read 内的元素进行状态更新，因此需要遍历，是一个线性时间复杂度的过程，可能存在性能抖动；
+- dirtyLocked 遍历中，会将 read 中未被删除的元素（非 nil 非 expunged）拷贝到 dirty 中；会将 read 中所有此前被删的元素统一置为 expunged 态.
+
+#### Q9. 总结
+
+- sync.Map 适用于读多、更新多、删多、写少的场景；
+- 倘若写操作过多，sync.Map 基本等价于互斥锁 + map；
+- sync.Map 可能存在性能抖动问题，主要发生于在读/删流程 miss 只读 map 次数过多时（触发 missLocked 流程），下一次插入操作的过程当中（dirtyLocked 流程）
