@@ -1,0 +1,1 @@
+#### gin handler和path绑定
