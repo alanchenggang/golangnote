@@ -405,7 +405,6 @@ ListIterator 。
 >- 抽象类中可以有普通成员变量，接口中没有普通成员变量，接口中的成员变量都是public static final的，一般用作常量。
 >- 抽象类中可以包含静态方法，接口中不能包含静态方法（**在Java SE 8中允许在接口中增加静态方法**）
 >- 一个类可以实现多个接口，但只能继承一个抽象类
->- 接口可以被多重实现，抽象类只能被单一继承
 >- 如果抽象类实现接口，则可以把接口中方法映射到抽象类中作为抽象方法而不必实现，而在抽象类的子类中实现接口中方法
 
 >抽象类不一定含有抽象方法，接口中的方法都是抽象方法。接口中的方法默认修饰符有public abstract。
@@ -517,7 +516,7 @@ ListIterator 。
 >2. Integer与Integer比较的时候，由于直接赋值的时候会进行自动装箱（ Integer a = 1 或 Integer  a = Integer.valueOf(1) ）,这里需要注意两个问题： 
 >
 >   	① 当整数范围在-128到127之间时，不需要创建新的Integer对象，而是从缓存（IntegerCache）中获取已经创建好的Integer对象。 
->   	  	  	  	  	
+>   	  	  	  	  	  	
 >   	②当大于或小于这个范围的时候，就会直接调用new Integer来创建Integer对象。 
 >
 >​       所以Integer a = 128 与 Integer b = Integer.valueOf(128)  都创建了新的Integer对象，用“==”比较会返回false 
