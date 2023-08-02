@@ -285,7 +285,7 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
     lock(&c.lock)
 
     // ...
-	//从阻塞度协程队列中取出一个 goroutine 的封装对象 sudog
+	//从阻塞读协程队列中取出一个 goroutine 的封装对象 sudog
     if sg := c.recvq.dequeue(); sg != nil {
         // Found a waiting receiver. We pass the value we want to send
         // directly to the receiver, bypassing the channel buffer (if any).
