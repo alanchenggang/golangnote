@@ -42,7 +42,6 @@
 2. TCP是可靠传输,使用了流量控制和拥塞控制,UDPUDP是不可靠传输
 3. TCP只能支持一对一通信,UDP支持一对一/一对多/多对一/多对多交互通信
 4. TCP的传输面向字节流,UDP的传输面向报文
-5. xxxxxxxxxx  public static void main(String[] args) {        int[] demo = new int[] { -2, -435, -12, -432, 43, 4 };        int end = demo.length - 1;        int sum = 0;        System.out.println(Arrays.toString(demo));        quickSort(demo, 0, end);        System.out.println(Arrays.toString(demo));        if (demo[end] < 0) {            System.out.println("0");            return;        }        int res = 0;        for (int i = end; i >= 0; --i) {            sum += demo[i];            if (sum >= 0) {                res++;            }                    }        System.out.println(res);    }    // 快排算法​    private static void quickSort(int[] demo, int head, int end) {        // TODO Auto-generated method stub        if (head >= end)            return;        int low = head;// 头指针        int high = end;// 尾指针        int pivot = demo[low]; // 基准        while (low < high) {            while (low < high && demo[high] > pivot) {                high--;            }            while (low < high && demo[low] <= pivot) {                low++;            }            // 找到交换            swap(demo, low, high);        }        // 没找到交换        swap(demo, low, head);        quickSort(demo, head, low - 1);        quickSort(demo, low + 1, end);    }​    private static void swap(int[] demo, int low, int high) {        int temp = demo[low];        demo[low] = demo[high];        demo[high] = temp;    }java
 6. TCP适用于要求可靠传输的应用,UDP适用于实时应用
 
 ## 转发的重定向的区别

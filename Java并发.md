@@ -411,13 +411,13 @@ class Phone{
 
 ```java
 new ThreadPoolExecutor(
-             CORE+1,
-             CORE+2,
-             60,
-             TimeUnit.SECONDS,
-              new ArrayBlockingQueue<>(50,true),
-             new ThreadFactoryBuilder().setNameFormat("computationally-Intensive-Pool").build(),
-             new ThreadPoolExecutor.AbortPolicy()
+             CORE+1, // 核心线程数
+             CORE+2, // 最大线程数
+             60, // 救急线程存活时间
+             TimeUnit.SECONDS, // 存活时间单位
+              new ArrayBlockingQueue<>(50,true), // 阻塞队列
+             new ThreadFactoryBuilder().setNameFormat("computationally-Intensive-Pool").build(), // 线程工厂
+             new ThreadPoolExecutor.AbortPolicy() // 拒绝策略
      );
 ```
 
