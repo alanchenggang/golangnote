@@ -210,11 +210,184 @@ func Test_slice(t *testing.T){
 
 ##### Q6. 扩容流程
 
+>- 倘若扩容后预期的新容量小于原切片的容量，则 panic
+>- 倘若切片元素大小为 0（元素类型为 struct{}），则直接复用一个全局的 zerobase 实例，直接返回
+>- 倘若预期的新容量超过老容量的两倍，则直接采用预期的新容量
+>- 倘若老容量小于 256，则直接采用老容量的2倍作为新容量
+>- 倘若老容量已经大于等于 256，则在老容量的基础上扩容 1/4 的比例并且累加上 192 的数值，持续这样处理，直到得到的新容量已经大于等于预期的新容量为止
+>- 结合 mallocgc 流程中，对内存分配单元 mspan 的等级制度，推算得到实际需要申请的内存空间大小
+>- 调用 mallocgc，对新切片进行内存初始化
+>- 调用 memmove 方法，将老切片中的内容拷贝到新切片中
+>- 返回扩容后的新切片
+
+```go
+func growslice(et *_type, old slice, cap int) slice {
+    //... 
+    if cap < old.cap {
+        panic(errorString("growslice: cap out of range"))
+    }
+
+
+    if et.size == 0 {
+        // 倘若元素大小为 0，则无需分配空间直接返回
+        return slice{unsafe.Pointer(&zerobase), old.len, cap}
+    }
+
+
+    // 计算扩容后数组的容量
+    newcap := old.cap
+    // 取原容量两倍的容量数值
+    doublecap := newcap + newcap
+    // 倘若新的容量大于原容量的两倍，直接取新容量作为数组扩容后的容量
+    if cap > doublecap {
+        newcap = cap
+    } else {
+        const threshold = 256
+        // 倘若原容量小于 256，则扩容后新容量为原容量的两倍
+        if old.cap < threshold {
+            newcap = doublecap
+        } else {
+            // 在原容量的基础上，对原容量 * 5/4 并且加上 192
+            // 循环执行上述操作，直到扩容后的容量已经大于等于预期的新容量为止
+            for 0 < newcap && newcap < cap {             
+                newcap += (newcap + 3*threshold) / 4
+            }
+            // 倘若数值越界了，则取预期的新容量 cap 封顶
+            if newcap <= 0 {
+                newcap = cap
+            }
+        }
+    }
+
+
+    var overflow bool
+    var lenmem, newlenmem, capmem uintptr
+    // 基于容量，确定新数组容器所需要的内存空间大小 capmem
+    switch {
+    // 倘若数组元素的大小为 1，则新容量大小为 1 * newcap.
+    // 同时会针对 span class 进行取整
+    case et.size == 1:
+        lenmem = uintptr(old.len)
+        newlenmem = uintptr(cap)
+        capmem = roundupsize(uintptr(newcap))
+        overflow = uintptr(newcap) > maxAlloc
+        newcap = int(capmem)
+    // 倘若数组元素为指针类型，则根据指针占用空间结合元素个数计算空间大小
+    // 并会针对 span class 进行取整
+    case et.size == goarch.PtrSize:
+        lenmem = uintptr(old.len) * goarch.PtrSize
+        newlenmem = uintptr(cap) * goarch.PtrSize
+        capmem = roundupsize(uintptr(newcap) * goarch.PtrSize)
+        overflow = uintptr(newcap) > maxAlloc/goarch.PtrSize
+        newcap = int(capmem / goarch.PtrSize)
+    // 倘若元素大小为 2 的指数，则直接通过位运算进行空间大小的计算   
+    case isPowerOfTwo(et.size):
+        var shift uintptr
+        if goarch.PtrSize == 8 {
+            // Mask shift for better code generation.
+            shift = uintptr(sys.Ctz64(uint64(et.size))) & 63
+        } else {
+            shift = uintptr(sys.Ctz32(uint32(et.size))) & 31
+        }
+        lenmem = uintptr(old.len) << shift
+        newlenmem = uintptr(cap) << shift
+        capmem = roundupsize(uintptr(newcap) << shift)
+        overflow = uintptr(newcap) > (maxAlloc >> shift)
+        newcap = int(capmem >> shift)
+    // 兜底分支：根据元素大小乘以元素个数
+    // 再针对 span class 进行取整     
+    default:
+        lenmem = uintptr(old.len) * et.size
+        newlenmem = uintptr(cap) * et.size
+        capmem, overflow = math.MulUintptr(et.size, uintptr(newcap))
+        capmem = roundupsize(capmem)
+        newcap = int(capmem / et.size)
+    }
+
+
+
+
+    // 进行实际的切片初始化操作
+    var p unsafe.Pointer
+    // 非指针类型
+    if et.ptrdata == 0 {
+        p = mallocgc(capmem, nil, false)
+        // ...
+    } else {
+        // 指针类型
+        p = mallocgc(capmem, et, true)
+        // ...
+    }
+    // 将切片的内容拷贝到扩容后的位置 p 
+    memmove(p, old.array, lenmem)
+    return slice{p, old.len, newcap}
+}
+```
+
 
 
 ##### Q7. 删除操作/拷贝操作
 
+从切片中删除元素的实现思路，本质上和切片内容截取的思路是一致的.
 
+如果需要删除 slice 中间的某个元素，操作思路则是采用内容截取加上元素追加的复合操作，可以先截取待删除元素的左侧部分内容，然后在此基础上追加上待删除元素后侧部分的内容：
+
+```go
+func Test_slice(t *testing.T){
+    s := []int{0,1,2,3,4}
+    // 删除 index = 2 的元素
+    s = append(s[:2],s[3:]...)
+    // s: [0,1,3,4], len: 4, cap: 5
+    t.Logf("s: %v, len: %d, cap: %d", s, len(s), cap(s))
+}
+```
+
+最后，当我们需要删除 slice 中的所有元素时，也可以采用切片内容截取的操作方式：s[:0]. 这样操作后，slice header 中的指针 array 仍指向远处，但是逻辑意义上其长度 len 已经等于 0，而容量 cap 则仍保留为原值.
+
+slice 的拷贝可以分为简单拷贝和完整拷贝两种类型.
+
+要实现简单拷贝，我们只需要对切片的字面量进行赋值传递即可，这样相当于创建出了一个新的 slice header 实例，但是其中的指针 array、容量 cap 和长度 len 仍和老的 slice header 实例相同.
+
+```go
+func Test_slice3(t *testing.T) {
+	s := []int{0, 1, 2, 3, 4}
+	s1 := s
+	t.Logf("address of s: %p, address of s1: %p", s, s1)
+}
+```
+
+![image-20230807223248025](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/image-20230807223248025.png)
+
+**切片的截取操作也属于是简单拷贝**
+
+slice 的完整复制，指的是会创建出一个和 slice 容量大小相等的独立的内存区域，并将原 slice 中的元素一一拷贝到新空间中.
+
+在实现上，slice 的完整复制可以调用系统方法 copy，代码示例如下，通过日志打印的方式可以看到，s 和 s1 的地址是相互独立的：
+
+```go
+func Test_slice(t *testing.T) {
+    s := []int{0, 1, 2, 3, 4}
+    s1 := make([]int, len(s))
+    copy(s1, s)
+    t.Logf("s: %v, s1: %v", s, s1)
+    t.Logf("address of s: %p, address of s1: %p", s, s1)
+}
+```
+
+![image-20230807223401456](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/image-20230807223401456.png)
 
 ##### Q8. 总结
 
+- slice 是一个长度可变的连续数据序列，在实现上基于一个 slice header 组成，其中包含的字段包括：指向内存空间地址起点的指针 array、一个表示了存储数据长度的 len 和分配空间长度的 cap
+
+- 由于 slice 在传递过程中，本质上传递的是 slice header 实例中的内存地址 array，因此属于引用传递
+
+- slice 在扩容时，遵循如下机制:
+
+  • 如果扩容时预期的新容量超过原容量的两倍，直接取预期的新容量
+
+  • 如果原容量小于 256，直接取原容量的两倍作为新容量
+
+  • 如果原容量大于等于 256，在原容量 n 的基础上循环执行 n += (n+3*256)/4 的操作，直到 n 大于等于预期新容量，并取 n 作为新容量
+
+-  **slice 不是并发安全的数据结构**
