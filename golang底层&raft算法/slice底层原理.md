@@ -333,14 +333,18 @@ func growslice(et *_type, old slice, cap int) slice {
 如果需要删除 slice 中间的某个元素，操作思路则是采用内容截取加上元素追加的复合操作，可以先截取待删除元素的左侧部分内容，然后在此基础上追加上待删除元素后侧部分的内容：
 
 ```go
-func Test_slice(t *testing.T){
-    s := []int{0,1,2,3,4}
-    // 删除 index = 2 的元素
-    s = append(s[:2],s[3:]...)
-    // s: [0,1,3,4], len: 4, cap: 5
-    t.Logf("s: %v, len: %d, cap: %d", s, len(s), cap(s))
+func Test_slice5(t *testing.T) {
+	s := []int{0, 1, 2, 3, 4}
+	// 删除 index = 2 的元素
+	s1 := append(s[:2], s[3:]...)
+	// s: [0,1,3,4], len: 4, cap: 5
+	t.Logf("s: %v, len: %d, cap: %d", s1, len(s1), cap(s1))
+	t.Logf("address of s: %p, address of s1: %p", s, s1)
+
 }
 ```
+
+![image-20230807224524194](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/image-20230807224524194.png)
 
 最后，当我们需要删除 slice 中的所有元素时，也可以采用切片内容截取的操作方式：s[:0]. 这样操作后，slice header 中的指针 array 仍指向远处，但是逻辑意义上其长度 len 已经等于 0，而容量 cap 则仍保留为原值.
 
