@@ -290,3 +290,86 @@ func (mux *ServeMux) match(path string) (h Handler, pattern string) {
 }
 ```
 
+#### Q3. 客户端数据结构
+
+客户端模块有一个 Client 类，实现对整个模块的封装：
+
+```go
+type Client struct {
+    // ...
+    Transport RoundTripper
+    // ...
+    Jar CookieJar
+    // ...
+    Timeout time.Duration
+}
+```
+
+- Transport：负责 http 通信的核心部分，也是接下来的讨论重点
+- Jar：cookie 管理
+- Timeout：超时设置
+
+RoundTripper 是通信模块的 interface，需要实现方法 Roundtrip，即通过传入请求 Request，与服务端交互后获得响应 Response.
+
+```go
+type RoundTripper interface {
+    RoundTrip(*Request) (*Response, error)
+}
+```
+
+Tranport 是 RoundTripper 的实现类，核心字段包括：
+
+- idleConn：空闲连接 map，实现复用
+- DialContext：新连接生成器
+
+```go
+type Transport struct {
+    idleConn     map[connectMethodKey][]*persistConn // most recently used at end
+    // ...
+    DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+    // ...
+}
+```
+
+Request
+
+```go
+type Request struct {
+    // 方法
+    Method string
+    // 请求路径
+    URL *url.URL
+    // 请求头
+    Header Header
+    // 请求参数内容
+    Body io.ReadCloser
+    // 服务器主机
+    Host string
+    // query 请求参数
+    Form url.Values
+    // 响应参数 struct
+    Response *Response
+    // 请求链路的上下文
+    ctx context.Context
+    // ...
+}
+```
+
+Response
+
+```go
+type Response struct {
+    // 请求状态，200 为 请求成功
+    StatusCode int    // e.g. 200
+    // http 协议，如：HTTP/1.0
+    Proto      string // e.g. "HTTP/1.0"
+    // 请求头
+    Header Header
+    // 响应参数内容  
+    Body io.ReadCloser
+    // 指向请求参数
+    Request *Request
+    // ...
+}
+```
+
