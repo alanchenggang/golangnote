@@ -95,3 +95,198 @@ type muxEntry struct {
 }
 ```
 
+#### Q3. Handler注册流程
+
+![image-20230808142725106](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/image-20230808142725106.png)
+
+在 net/http 包下声明了一个单例 ServeMux，当用户直接通过公开方法 http.HandleFunc 注册 handler 时，则会将其注册到 DefaultServeMux 当中
+
+```go
+var DefaultServeMux = &defaultServeMux
+
+var defaultServeMux ServeMux
+
+
+func HandleFunc(pattern string, handler func(ResponseWriter, *Request)) {
+    DefaultServeMux.HandleFunc(pattern, handler)
+}
+
+//ServeMux.HandleFunc 内部会将处理函数 handler 转为实现了 ServeHTTP 方法的 HandlerFunc 类型，将其作为 Handler interface 的实现类注册到 ServeMux 的路由 map 当中.
+
+type HandlerFunc func(ResponseWriter, *Request)
+
+
+// ServeHTTP calls f(w, r).
+func (f HandlerFunc) ServeHTTP(w ResponseWriter, r *Request) {
+    f(w, r)
+}
+
+
+func (mux *ServeMux) HandleFunc(pattern string, handler func(ResponseWriter, *Request)) {
+    // ...
+    mux.Handle(pattern, HandlerFunc(handler))
+}
+```
+
+实现路由注册的核心逻辑位于 ServeMux.Handle 方法中
+
+```go
+func (mux *ServeMux) Handle(pattern string, handler Handler) {
+    // 加写锁
+    mux.mu.Lock()
+    defer mux.mu.Unlock()
+    // ...
+
+	//将 path 和 handler 包装成一个 muxEntry，以 path 为 key 注册到路由 map ServeMux.m 中
+    e := muxEntry{h: handler, pattern: pattern}
+    mux.m[pattern] = e
+    // 响应模糊匹配机制. 对于以 '/' 结尾的 path，根据 path 长度将 muxEntry 有序插入到数组 ServeMux.es 中
+    if pattern[len(pattern)-1] == '/' {
+        mux.es = appendSorted(mux.es, e)
+    }
+    // ...
+}
+
+func appendSorted(es []muxEntry, e muxEntry) []muxEntry {
+    n := len(es)
+    i := sort.Search(n, func(i int) bool {
+        return len(es[i].pattern) < len(e.pattern)
+    })
+    if i == n {
+        return append(es, e)
+    }
+    es = append(es, muxEntry{}) // try to grow the slice in place, any entry works.
+    copy(es[i+1:], es[i:])      // Move shorter entries down
+    es[i] = e
+    return es
+}
+```
+
+#### Q4. 启动 server流程
+
+![image-20230808143054203](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/image-20230808143054203.png)
+
+调用 net/http 包下的公开方法 ListenAndServe，可以实现对服务端的一键启动. 内部会声明一个新的 Server 对象，嵌套执行 Server.ListenAndServe 方法.
+
+```go
+func ListenAndServe(addr string, handler Handler) error {
+    server := &Server{Addr: addr, Handler: handler}
+    return server.ListenAndServe()
+}
+```
+
+Server.ListenAndServe 方法中，根据用户传入的端口，申请到一个监听器 listener，继而调用 Server.Serve 方法.
+
+```go
+func (srv *Server) ListenAndServe() error {
+    // ...
+    addr := srv.Addr
+    if addr == "" {
+        addr = ":http"
+    }
+    ln, err := net.Listen("tcp", addr)
+    // ...    
+    return srv.Serve(ln)
+}
+```
+
+![image-20230808143219499](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/image-20230808143219499.png)
+
+Server.Serve 方法是核心，体现了 http 服务端的运行架构：for + listener.accept 模式
+
+```go
+var ServerContextKey = &contextKey{"http-server"}
+
+type contextKey struct {
+    name string
+}
+
+func (srv *Server) Serve(l net.Listener) error {
+   // ...
+    // 将 server 封装成一组 kv 对，添加到 context 当中
+   ctx := context.WithValue(baseCtx, ServerContextKey, srv)
+    // 开启 for 循环，每轮循环调用 Listener.Accept 方法阻塞等待新连接到达
+    // 每有一个连接到达，创建一个 goroutine 异步执行 conn.serve 方法负责处理
+    for {
+        rw, err := l.Accept()
+        // ...
+        connCtx := ctx
+        // ...
+        
+        c := srv.newConn(rw)
+        // ...
+        go c.serve(connCtx)
+    }
+}
+
+conn.serve 是响应客户端连接的核心方法：
+	1. 从 conn 中读取到封装到 response 结构体，以及请求参数 http.Request
+	2. 调用 serveHandler.ServeHTTP 方法，根据请求的 path 为其分配 handler
+	3. 通过特定 handler 处理并响应请求
+func (c *conn) serve(ctx context.Context) {
+    // ...
+    c.r = &connReader{conn: c}
+    c.bufr = newBufioReader(c.r)
+    c.bufw = newBufioWriterSize(checkConnErrorWriter{c}, 4<<10)
+
+
+    for {
+        w, err := c.readRequest(ctx)
+        // ...
+        serverHandler{c.server}.ServeHTTP(w, w.req)
+        w.cancelCtx()
+        // ...
+    }
+}
+
+在 serveHandler.ServeHTTP 方法中，会对 Handler 作判断，倘若其未声明，则取全局单例 DefaultServeMux 进行路由匹配
+func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
+    handler := sh.srv.Handler
+    if handler == nil {
+        handler = DefaultServeMux
+    }
+    // ...
+    handler.ServeHTTP(rw, req)
+}
+
+接下来，依次调用 ServeMux.ServeHTTP、ServeMux.Handler、ServeMux.handler 等方法，最终在 ServeMux.match 方法中，以 Request 中的 path 为 pattern，在路由字典 Server.m 中匹配 handler，最后调用 handler.ServeHTTP 方法进行请求的处理和响应.
+func (mux *ServeMux) ServeHTTP(w ResponseWriter, r *Request) {
+    // ...
+    h, _ := mux.Handler(r)
+    h.ServeHTTP(w, r)
+}
+
+func (mux *ServeMux) Handler(r *Request) (h Handler, pattern string) {
+    // ...
+    return mux.handler(host, r.URL.Path)
+}
+
+func (mux *ServeMux) handler(host, path string) (h Handler, pattern string) {
+    mux.mu.RLock()
+    defer mux.mu.RUnlock()
+    
+    // ...
+    h, pattern = mux.match(path)
+    // ...
+    return
+}
+当通过路由字典 Server.m 未命中 handler 时，此时会启动模糊匹配模式，两个核心规则如下：
+
+• 以 '/' 结尾的 pattern 才能被添加到 Server.es 数组中，才有资格参与模糊匹配
+• 模糊匹配时，会找到一个与请求路径 path 前缀完全匹配且长度最长的 pattern，其对应的handler 会作为本次请求的处理函数.
+func (mux *ServeMux) match(path string) (h Handler, pattern string) {
+    v, ok := mux.m[path]
+    if ok {
+        return v.h, v.pattern
+    }
+
+    // ServeMux.es 本身是按照 pattern 的长度由大到小排列的
+    for _, e := range mux.es {
+        if strings.HasPrefix(path, e.pattern) {
+            return e.h, e.pattern
+        }
+    }
+    return nil, ""
+}
+```
+
