@@ -373,3 +373,154 @@ type Response struct {
 }
 ```
 
+#### Q4. 客户端请求流程
+
+客户端发起一次 http 请求大致分为几个步骤：
+
+- 构造 http 请求参数
+- 获取用于与服务端交互的 tcp 连接
+- 通过 tcp 连接发送请求参数
+- 通过 tcp 连接接收响应结果
+
+![image-20230808145552174](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/image-20230808145552174.png)
+
+调用 net/http 包下的公开方法 Post 时，需要传入服务端地址 url，请求参数格式 contentType 以及请求参数的 io reader.
+
+```go
+// DefaultClient is the default Client and is used by Get, Head, and Post.
+var DefaultClient = &Client{}
+
+func Post(url, contentType string, body io.Reader) (resp *Response, err error) {
+	return DefaultClient.Post(url, contentType, body)
+}
+```
+
+Client.Post 方法中，首先会结合用户的入参，构造出完整的请求参数 Request；继而通过 Client.Do 方法，处理这笔请求.
+
+```go
+func (c *Client) Post(url, contentType string, body io.Reader) (resp *Response, err error) {
+    req, err := NewRequest("POST", url, body)
+    // ...
+    req.Header.Set("Content-Type", contentType)
+    return c.Do(req)
+}
+```
+
+NewRequestWithContext 方法中，根据用户传入的 url、method等信息，构造了 Request 实例.
+
+```go
+func NewRequestWithContext(ctx context.Context, method, url string, body io.Reader) (*Request, error) {
+    // ...
+    u, err := urlpkg.Parse(url)
+    // ...
+    rc, ok := body.(io.ReadCloser)
+    // ...
+    req := &Request{
+        ctx:        ctx,
+        Method:     method,
+        URL:        u,
+        // ...
+        Header:     make(Header),
+        Body:       rc,
+        Host:       u.Host,
+    }
+    // ...
+    return req, nil
+}
+```
+
+发送请求方法时，经由 Client.Do、Client.do 辗转，继而步入到 Client.send 方法中.
+
+```go
+func (c *Client) Do(req *Request) (*Response, error) {
+    return c.do(req)
+}
+
+func (c *Client) do(req *Request) (retres *Response, reterr error) {
+    var (
+        deadline      = c.deadline()
+        resp          *Response
+        // ...
+    )    
+    for {
+        // ...
+        var err error       
+        if resp, didTimeout, err = c.send(req, deadline); err != nil {
+            // ...
+        }
+        // ...
+    }
+}
+在 Client.send 方法中，会在通过 send 方法发送请求之前和之后，分别对 cookie 进行更新.
+
+func (c *Client) send(req *Request, deadline time.Time) (resp *Response, didTimeout func() bool, err error) {
+    // 设置 cookie 到请求头中
+    if c.Jar != nil {
+        for _, cookie := range c.Jar.Cookies(req.URL) {
+            req.AddCookie(cookie)
+        }
+    }
+    // 发送请求
+    resp, didTimeout, err = send(req, c.transport(), deadline)
+    if err != nil {
+        return nil, didTimeout, err
+    }
+    // 更新 resp 的 cookie 到请求头中
+    if c.Jar != nil {
+        if rc := resp.Cookies(); len(rc) > 0 {
+            c.Jar.SetCookies(req.URL, rc)
+        }
+    }
+    return resp, nil, nil
+}
+```
+
+在调用 send 方法时，需要注入 RoundTripper 模块，默认会使用全局单例 DefaultTransport 进行注入，核心逻辑位于 Transport.RoundTrip 方法中，其中分为两个步骤：
+
+- 获取/构造 tcp 连接
+- 通过 tcp 连接完成与服务端的交互
+
+```go
+var DefaultTransport RoundTripper = &Transport{
+    // ...
+    DialContext: defaultTransportDialContext(&net.Dialer{
+        Timeout:   30 * time.Second,
+        KeepAlive: 30 * time.Second,
+    }),
+    // ...
+}
+
+
+func (c *Client) transport() RoundTripper {
+    if c.Transport != nil {
+        return c.Transport
+    }
+    return DefaultTransport
+}
+
+
+func send(ireq *Request, rt RoundTripper, deadline time.Time) (resp *Response, didTimeout func() bool, err error) {
+    // ...
+    resp, err = rt.RoundTrip(req)
+    // ...
+    return resp, nil, nil
+}
+
+func (t *Transport) RoundTrip(req *Request) (*Response, error) {
+    return t.roundTrip(req)
+}
+
+func (t *Transport) roundTrip(req *Request) (*Response, error) {
+    // ...
+    for {          
+        // ...    
+        treq := &transportRequest{Request: req, trace: trace, cancelKey: cancelKey}      
+        // ...
+        pconn, err := t.getConn(treq, cm)        
+        // ...
+        resp, err = pconn.roundTrip(treq)          
+        // ...
+    }
+}
+```
+
