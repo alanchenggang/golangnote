@@ -181,7 +181,29 @@ func DeferRecover() {
 
 #### Q1. go中接口是什么
 
-
+>在Go中，接口是一种类型，它定义了一组方法的签名。任何实现这些方法的类型都可以被视为实现了该接口。接口提供了一种方式来实现多态性，使得不同的类型可以以相同的方式进行处理。
+>
+>```go
+>type Shape interface {
+>    area() float64
+>}
+>
+>type Circle struct {
+>    x, y, radius float64
+>}
+>
+>func (c Circle) area() float64 {
+>    return math.Pi * c.radius * c.radius
+>}
+>
+>func main() {
+>    var s Shape
+>    s = Circle{x: 0, y: 0, radius: 5}
+>    fmt.Println(s.area())
+>}
+>```
+>
+>
 
 ### 数组
 
@@ -331,7 +353,7 @@ func AppendDemo() {
 
 同数组遍历一致 可使用普通for循环或者for...range 遍历
 
-
+####  Q4. 
 
 ### 时间操作
 
