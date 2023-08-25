@@ -64,6 +64,10 @@ Java 8 直接删除了永久代（Permanent Generation），改用 Metaspace。�
 
 
 ---
+
+![72433648.png](https://cscgblog-1301638685.cos.ap-chengdu.myqcloud.com/note/bf6df0c0-32ee-11ea-b0e0-6da2f5afc39e)
+
+---
 ## JVM启动流程探究
 ---
 ### 1. 配置JVM装载环境
