@@ -1,12 +1,3 @@
----
-title: Git基础
-date: 2021-10-04 22:48:38.402
-updated: 2021-10-08 13:18:37.221
-url: /archives/gitbasic
-categories: Git
-tags: Git | 基础
----
-
 # 1. Git介绍
 ---
 分布式版本控制

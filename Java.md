@@ -1,11 +1,4 @@
----
-title: Java基础
-date: 2021-10-08 12:59:54.604
-updated: 2021-10-13 15:58:37.201
-url: /archives/javabasic
-categories: 
-tags: 基础 | Java
----
+
 
 # 集合
 ---
@@ -516,7 +509,7 @@ ListIterator 。
 >2. Integer与Integer比较的时候，由于直接赋值的时候会进行自动装箱（ Integer a = 1 或 Integer  a = Integer.valueOf(1) ）,这里需要注意两个问题： 
 >
 >   	① 当整数范围在-128到127之间时，不需要创建新的Integer对象，而是从缓存（IntegerCache）中获取已经创建好的Integer对象。 
->   	  	  	  	  	  	
+>   	  	  	  	  	  	  	
 >   	②当大于或小于这个范围的时候，就会直接调用new Integer来创建Integer对象。 
 >
 >​       所以Integer a = 128 与 Integer b = Integer.valueOf(128)  都创建了新的Integer对象，用“==”比较会返回false 
